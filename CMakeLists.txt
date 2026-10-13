@@ -67,6 +67,9 @@ add_library(MeshFEMSparse STATIC
     src/lib/MeshFEMSparse/Solvers/pardiso_ordering.cc
     src/lib/MeshFEMSparse/Solvers/AccelerateFactorizer.cc
     src/lib/MeshFEMSparse/Solvers/accelerate_ordering.cc
+    src/lib/MeshFEMSparse/Solvers/Iterative/LinearOperator.cc
+    src/lib/MeshFEMSparse/Solvers/Iterative/MASPreconditioner.cc
+    src/lib/MeshFEMSparse/Solvers/Iterative/PCG.cc
 )
 
 if (MESHFEM_USE_LEGACY_CATAMARI)
@@ -115,6 +118,20 @@ if(MESHFEM_WITH_CHOLMOD)
         src/lib/MeshFEMSparse/Solvers/ParallelNestedDissection/nesdis_bisector.cc
     )
     target_link_libraries(MeshFEMSparse PUBLIC cholmod::cholmod)
+
+    # SuiteSparse >= 7 bundles METIS inside CHOLMOD under prefixed symbol
+    # names; MASPreconditioner uses it for subdomain partitioning when present.
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_LIBRARIES cholmod::cholmod)
+    check_cxx_source_compiles("
+        #include <cstdint>
+        extern \"C\" int SuiteSparse_metis_METIS_PartGraphKway(int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, void *, void *, int64_t *, int64_t *, int64_t *);
+        int main() { return SuiteSparse_metis_METIS_PartGraphKway != nullptr ? 0 : 1; }"
+        MESHFEM_HAVE_SUITESPARSE_METIS)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+    if (MESHFEM_HAVE_SUITESPARSE_METIS)
+        target_compile_definitions(MeshFEMSparse PRIVATE MESHFEM_WITH_SUITESPARSE_METIS)
+    endif()
 endif()
 
 if (MESHFEM_WITH_CATAMARI)
