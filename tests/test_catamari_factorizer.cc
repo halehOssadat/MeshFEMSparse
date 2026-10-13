@@ -13,8 +13,9 @@ namespace {
 template<class Matrix>
 void checkSolves(Matrix &A, const SuiteSparseMatrix &scalarA, bool single,
                  bool left, CatamariFactorizer::OrderingMethod ordering,
-                 const std::vector<size_t> &pins, bool blockAccel = true) {
+                 const std::vector<size_t> &pins, bool blockAccel = true, bool identityPins = false) {
     CatamariFactorizer f(false, single);
+    f.setIdentityPinning(identityPins);
     f.orderingMethod = ordering;
     f.setUseLeftLooking(left);
     f.setUseBlockAccel(blockAccel);
@@ -98,7 +99,7 @@ void checkSolves(Matrix &A, const SuiteSparseMatrix &scalarA, bool single,
 }
 
 template<size_t BS>
-void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod ordering, int pinMode, bool contiguous, bool blockAccel) {
+void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod ordering, int pinMode, bool contiguous, bool blockAccel, bool identityPins = false) {
     SystemAssembler<BS> assembler(20);
     auto pattern = assembler.blockSparsityPattern(19, [](size_t i) { return std::array<size_t, 2>{{i, i + 1}}; });
     pattern->setZero();
@@ -113,11 +114,11 @@ void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod orde
     if (pinMode == 2) pins.push_back(1);
     if (contiguous) {
         auto A = pattern->template cloneWithLayout<true>();
-        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel);
+        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel, identityPins);
     }
     else {
         auto A = pattern->template cloneWithLayout<false>();
-        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel);
+        checkSolves(*A, scalar, single, left, ordering, pins, blockAccel, identityPins);
     }
 }
 }
@@ -160,6 +161,70 @@ TEST_CASE("Catamari precision preserves scalar and block solver behavior", "[cat
         SuiteSparseMatrix reference = A;
         checkSolves(A, reference, single, left, ordering, pinMode ? std::vector<size_t>{1} : std::vector<size_t>{});
     }
+}
+
+TEST_CASE("Catamari conversion-plan pins preserve block solves", "[catamari][identity_pins]") {
+    tbb::global_control limit(tbb::global_control::max_allowed_parallelism, 4);
+    const bool single = GENERATE(false, true);
+    const bool left = GENERATE(false, true);
+    const auto ordering = GENERATE(CatamariFactorizer::OrderingMethod::Native, CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
+    const bool contiguous = GENERATE(false, true);
+    SECTION("scalar") { checkBlocks<1>(single, left, ordering, 2, contiguous, true, true); }
+    SECTION("partial 2D block") { checkBlocks<2>(single, left, ordering, 2, contiguous, true, true); }
+    SECTION("partial 3D block") { checkBlocks<3>(single, left, ordering, 2, contiguous, true, true); }
+    SECTION("disabled block acceleration") { checkBlocks<2>(single, left, ordering, 2, contiguous, false, true); }
+}
+
+TEST_CASE("Catamari identity pins update without changing symbolic analysis", "[catamari][identity_pins]") {
+    tbb::global_control limit(tbb::global_control::max_allowed_parallelism, 4);
+    SystemAssembler<2> assembler(20);
+    auto H = assembler.blockSparsityPattern(19, [](size_t i) { return std::array<size_t, 2>{{i, i + 1}}; });
+    H->setZero();
+    for (auto e : H->toScalar()) H->addNZScalar(e.i, e.j, e.i == e.j ? 5.0 : -.125);
+    auto A = H->cloneWithContiguousBlocks();
+    const auto originalValues = A->Ax;
+    CatamariFactorizer f;
+    f.setIdentityPinning(true);
+    f.factorizeSymbolic(*A, {});
+    const auto permutation = f.getInversePermutation();
+    const auto nnz = f.getFactorNNZ();
+    const auto *nd = f.ndOrdering() ? &*f.ndOrdering() : nullptr;
+    auto check = [&](const std::vector<size_t> &pins, bool cloned = false) {
+        Eigen::VectorXd expected = Eigen::VectorXd::Random(40);
+        for (size_t i : pins) expected[i] = 0;
+        auto rhs = A->apply(expected);
+        for (size_t i : pins) rhs[i] = 17; // Must ignore the supplied pinned RHS.
+        REQUIRE((f.solve(rhs) - expected).norm() < 1e-11);
+        REQUIRE(f.n() == 40);
+        REQUIRE(f.n_reduced() == 40);
+        // BlockCatamari clones currently omit the cached NNZ statistic.
+        if (!cloned) REQUIRE(f.getFactorNNZ() == nnz);
+        REQUIRE(f.getInversePermutation() == permutation);
+        if (!cloned) REQUIRE((f.ndOrdering() ? &*f.ndOrdering() : nullptr) == nd);
+        REQUIRE(A->Ax == originalValues);
+    };
+    const std::vector<std::vector<size_t>> masks{{1}, {0, 1, 39}, {}, {17, 23}};
+    for (const auto &pins : masks) {
+        f.updateFixedVars(*A, pins);
+        REQUIRE_FALSE(f.hasNumericFactorization());
+        f.factorizeNumeric(*A);
+        check(pins);
+    }
+    // Pins travel with stashed numeric factors.
+    f.stashFactorization();
+    f.updateFixedVars(*A, {0});
+    f.factorizeNumeric(*A);
+    f.swapStashedFactorization();
+    check(masks.back(), true);
+    f.swapStashedFactorization();
+    check({0}, true);
+    REQUIRE_THROWS(f.updateFixedVars(*A, {40}));
+    f.clearStashedFactorization();
+    std::vector<size_t> all(40);
+    std::iota(all.begin(), all.end(), 0);
+    f.updateFixedVars(*A, all);
+    f.factorizeNumeric(*A);
+    REQUIRE(f.solve(Eigen::VectorXd(Eigen::VectorXd::Ones(40))).norm() == 0);
 }
 
 TEST_CASE("Catamari precision factory rejects legacy mode", "[catamari][precision]") {
@@ -229,13 +294,61 @@ TEST_CASE("Catamari symbolic reuse resets scalar fallback mappings", "[catamari]
     REQUIRE((f.solve(b) - expected).norm() < (single ? 1e-5 : 1e-12));
 }
 #if MESHFEM_WITH_CHOLMOD
-TEST_CASE("Catamari temporal ND provider defaults to 32 incremental analyses", "[temporal_nd][catamari][factory]") {
+TEST_CASE("Catamari adaptive ordering reports temporal metadata only for ND", "[adaptive_ordering][temporal_nd][catamari]") {
+    auto base = make_cholesky_factorizer(CholeskyProvider::CatamariAdaptive);
+    auto &f = dynamic_cast<CatamariFactorizer &>(*base);
+    f.setTemporalReusePeriod(1);
+    auto &selection = f.adaptiveOrdering;
+    selection.method_switch_threshold_soft = std::numeric_limits<double>::infinity();
+
+    TripletMatrix<> triplets(16, 16);
+    for (size_t v = 0; v < 16; ++v) {
+        triplets.addNZ(v, v, 4);
+        if (v + 1 < 16) triplets.addNZ(v, v + 1, -1);
+    }
+    SuiteSparseMatrix matrix(triplets);
+    matrix.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
+    Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(16, -1, 1);
+    Eigen::VectorXd rhs = matrix.apply(expected);
+    auto analyzeAndSolve = [&]() {
+        f.factorizeSymbolic(matrix, {});
+        f.factorizeNumeric(matrix);
+        REQUIRE((f.solve(rhs) - expected).norm() < 1e-10);
+    };
+    analyzeAndSolve(); // Full ND.
+    analyzeAndSolve(); // Incremental ND.
+    analyzeAndSolve(); // Periodic full ND.
+    const auto &nd = selection.factorization_times_for_method[0];
+    REQUIRE(nd.incrementalReuseLimit == 1);
+    REQUIRE(nd.symbolic.count == 3);
+    REQUIRE(nd.fullAnalysis.count == 2);
+    REQUIRE(nd.incrementalAnalysis.count == 1);
+
+    selection.method_switch_threshold_soft = 0; // Force switches whenever warmup permits.
+    analyzeAndSolve(); // AMD must not inherit the last ND call's statistics.
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::AMD);
+    const auto &amd = selection.factorization_times_for_method[1];
+    REQUIRE(amd.incrementalReuseLimit == 0);
+    REQUIRE(amd.symbolic.count == 1);
+    REQUIRE_FALSE(amd.fullAnalysis.known());
+    REQUIRE_FALSE(amd.incrementalAnalysis.known());
+    analyzeAndSolve(); // Returning from AMD starts with a fresh ND tree.
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
+    REQUIRE(f.temporalReuseStatistics().full_rebuild);
+    analyzeAndSolve(); // Per-switch warmup keeps ND for its second analysis.
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
+    REQUIRE_FALSE(f.temporalReuseStatistics().full_rebuild);
+    analyzeAndSolve();
+    REQUIRE(selection.currentOrderingMethod() == CatamariFactorizer::OrderingMethod::AMD);
+}
+
+TEST_CASE("Catamari temporal ND provider defaults to 64 incremental analyses", "[temporal_nd][catamari][factory]") {
     const bool single = GENERATE(false, true);
     auto base = make_cholesky_factorizer(CholeskyProvider::CatamariNesdisReuse, single);
     auto *f = dynamic_cast<CatamariFactorizer *>(base.get());
     REQUIRE(f != nullptr);
     REQUIRE(f->orderingMethod == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
-    REQUIRE(f->temporalReusePeriod() == 32);
+    REQUIRE(f->temporalReusePeriod() == 64);
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
 
     TripletMatrix<> triplets(16, 16);
@@ -245,11 +358,11 @@ TEST_CASE("Catamari temporal ND provider defaults to 32 incremental analyses", "
     }
     SuiteSparseMatrix matrix(triplets);
     matrix.symmetry_mode = SuiteSparseMatrix::SymmetryMode::UPPER_TRIANGLE;
-    for (size_t call = 0; call < 34; ++call) {
+    for (size_t call = 0; call < 66; ++call) {
         CAPTURE(call, single);
         base->factorizeSymbolic(matrix, {});
         const auto &stats = f->temporalReuseStatistics();
-        const bool full = call == 0 || call == 33;
+        const bool full = call == 0 || call == 65;
         REQUIRE(stats.full_rebuild == full);
         REQUIRE(stats.repartitioned_vertices == (full ? 16 : 0));
     }
