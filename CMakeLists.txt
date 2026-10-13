@@ -125,13 +125,18 @@ if(MESHFEM_WITH_CHOLMOD)
     # names; MASPreconditioner uses it for subdomain partitioning when present.
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_LIBRARIES cholmod::cholmod)
+    # Actually call the function (in a branch the compiler cannot remove) so
+    # that the check fails to link when the prefixed symbol is missing.
     check_cxx_source_compiles("
         #include <cstdint>
         extern \"C\" int SuiteSparse_metis_METIS_PartGraphKway(int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, int64_t *, void *, void *, int64_t *, int64_t *, int64_t *);
-        int main() { return SuiteSparse_metis_METIS_PartGraphKway != nullptr ? 0 : 1; }"
-        MESHFEM_HAVE_SUITESPARSE_METIS)
+        int main(int argc, char **) {
+            if (argc > 1000) return SuiteSparse_metis_METIS_PartGraphKway(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr);
+            return 0;
+        }"
+        MESHFEM_HAVE_SUITESPARSE_METIS_SYMBOL)
     unset(CMAKE_REQUIRED_LIBRARIES)
-    if (MESHFEM_HAVE_SUITESPARSE_METIS)
+    if (MESHFEM_HAVE_SUITESPARSE_METIS_SYMBOL)
         target_compile_definitions(MeshFEMSparse PRIVATE MESHFEM_WITH_SUITESPARSE_METIS)
     endif()
 endif()
