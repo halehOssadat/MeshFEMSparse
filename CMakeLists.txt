@@ -17,6 +17,7 @@ option(MESHFEM_WITH_SCOTCH           "Compile MeshFEM with support for Scotch re
 option(MESHFEM_WITH_MKL_PARDISO      "Compile MeshFEM with MKL Pardiso"   OFF)
 option(MESHFEM_WITH_PARDISO          "Compile MeshFEM with Pardiso"   OFF)
 option(MESHFEM_WITH_CUDSS            "Compile MeshFEM with NVIDIA cuDSS (GPU sparse direct solver)"   OFF)
+option(MESHFEM_WITH_CUDA_PCG         "Compile MeshFEM with the CUDA PCG solver ported from libuipc"   OFF)
 option(MESHFEM_NO_GPL                "Compile MeshFEM without GPL-licensed dependencies (UMFPACK, supernodal CHOLMOD, etc.)" OFF)
 option(MESHFEM_WITH_CHOLMOD          "Compile MeshFEM with CHOLMOD for LL^T factorization" ON)
 option(MESHFEM_WITH_UMFPACK          "Compile MeshFEM with UMFPACK for LU factorization (GPL licensed)" OFF)
@@ -68,9 +69,6 @@ add_library(MeshFEMSparse STATIC
     src/lib/MeshFEMSparse/Solvers/pardiso_ordering.cc
     src/lib/MeshFEMSparse/Solvers/AccelerateFactorizer.cc
     src/lib/MeshFEMSparse/Solvers/accelerate_ordering.cc
-    src/lib/MeshFEMSparse/Solvers/Iterative/LinearOperator.cc
-    src/lib/MeshFEMSparse/Solvers/Iterative/MASPreconditioner.cc
-    src/lib/MeshFEMSparse/Solvers/Iterative/PCG.cc
     src/lib/MeshFEMSparse/Solvers/CuDSSFactorizer.cc
 )
 
@@ -122,7 +120,7 @@ if(MESHFEM_WITH_CHOLMOD)
     target_link_libraries(MeshFEMSparse PUBLIC cholmod::cholmod)
 
     # SuiteSparse >= 7 bundles METIS inside CHOLMOD under prefixed symbol
-    # names; MASPreconditioner uses it for subdomain partitioning when present.
+    # names; kept for MAS subdomain partitioning (libuipc MAS port).
     include(CheckCXXSourceCompiles)
     set(CMAKE_REQUIRED_LIBRARIES cholmod::cholmod)
     # Actually call the function (in a branch the compiler cannot remove) so
@@ -173,6 +171,44 @@ if (MESHFEM_WITH_CUDSS)
     find_package(cudss REQUIRED)
     target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_CUDSS)
     target_link_libraries(MeshFEMSparse PUBLIC cudss CUDA::cudart)
+endif()
+
+if (MESHFEM_WITH_CUDA_PCG)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+
+    # Separate target: the libuipc code needs C++20 and its own include root,
+    # while MeshFEMSparse stays C++17 and never sees these headers.
+    add_library(MeshFEMSparseCUDA STATIC
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/linear_system/spmv.cu
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/linear_system/global_linear_system.cu
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/finite_element/fem_diag_preconditioner.cu
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/linear_system/iterative_solver.cu
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/linear_system/linear_pcg.cu
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/CudaPCGWrapper.cu
+    )
+    target_include_directories(MeshFEMSparseCUDA PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/MeshFEMSparse/Solvers/Iterative/cuda
+    )
+    set_target_properties(MeshFEMSparseCUDA PROPERTIES
+        CUDA_STANDARD 20
+        CUDA_STANDARD_REQUIRED ON
+        POSITION_INDEPENDENT_CODE ON
+    )
+    target_compile_options(MeshFEMSparseCUDA PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+    )
+    target_link_libraries(MeshFEMSparseCUDA PUBLIC MeshFEMCore Eigen3::Eigen CUDA::cudart)
+
+    # Host-side (C++17) MeshFEM -> libuipc input conversion, compiled into MeshFEMSparse itself.
+    target_sources(MeshFEMSparse PRIVATE
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/block_csc_to_triplets.cc
+        src/lib/MeshFEMSparse/Solvers/Iterative/cuda/CudaPCGWrapper.cc
+    )
+
+    target_compile_definitions(MeshFEMSparse PUBLIC MESHFEM_WITH_CUDA_PCG)
+    target_link_libraries(MeshFEMSparse PUBLIC MeshFEMSparseCUDA)
 endif()
 
 if (MESHFEMSPARSE_BUILD_TESTS)

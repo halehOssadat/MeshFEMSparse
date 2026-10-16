@@ -12,7 +12,7 @@ add_executable(MeshFEMSparse_unit_tests
     test_cudss_factorizer.cc
     test_catamari_solve_kernels.cc
     test_catamari_factorizer.cc
-    test_mas_pcg.cc
+    test_cuda_pcg.cc
 )
 
 target_link_libraries(MeshFEMSparse_unit_tests PUBLIC

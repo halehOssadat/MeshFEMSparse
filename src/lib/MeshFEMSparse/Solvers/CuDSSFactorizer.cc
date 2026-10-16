@@ -219,7 +219,7 @@ void CuDSSFactorizer::m_cudssRelease() {
 // Expects `m_cudssRelease()` to have been called first (so nothing is leaked).
 void CuDSSFactorizer::m_copyPatternToDevice(const SuiteSparseMatrix &A) {
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
-
+    BENCHMARK_SCOPED_TIMER_SECTION timer("CuDSSFactorizer.m_copyPatternToDevice");
     if (A_cudss) throw std::logic_error("[cuDSS] m_copyPatternToDevice called without releasing the previous matrix");
     if (A.m != A.n) throw std::runtime_error("[cuDSS] Matrix must be square");
     // Upper triangle in CSC == lower triangle in CSR, which is what we tell cuDSS below.
