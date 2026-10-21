@@ -3,7 +3,7 @@
 #include <cuda_tool/linear_reduction.h>
 #include <cuda_device/builtin.h>
 #include <uipc/common/log.h>
-#include <MeshFEMCore/GlobalBenchmark.hh>
+#include <linear_system/synced_timer.h>
 namespace uipc::backend::cuda
 {
 namespace
@@ -156,7 +156,7 @@ SizeT LinearPCG::pcg(cuda_tool::DenseVectorView<Float>  x,
                      cuda_tool::CDenseVectorView<Float> b,
                      SizeT                              max_iter)
 {
-    MeshFEM::BENCHMARK_SCOPED_TIMER_SECTION pcg_timer("PCG");
+    SyncedTimer pcg_timer("PCG");
 
     SizeT k = 0;
     // r = b - A * x
@@ -173,7 +173,7 @@ SizeT LinearPCG::pcg(cuda_tool::DenseVectorView<Float>  x,
 
     // z = P * r (apply preconditioner)
     {
-        MeshFEM::BENCHMARK_SCOPED_TIMER_SECTION timer("Apply Preconditioner");
+        SyncedTimer timer("Apply Preconditioner");
         apply_preconditioner(z, r, d_converged_false.view());
     }
 
@@ -194,7 +194,7 @@ SizeT LinearPCG::pcg(cuda_tool::DenseVectorView<Float>  x,
     for(k = 1; k < max_iter; ++k)
     {
         {
-            MeshFEM::BENCHMARK_SCOPED_TIMER_SECTION timer("SpMV");
+            SyncedTimer timer("SpMV");
             spmv(p.cview(), Ap.view());
         }
 
@@ -207,7 +207,7 @@ SizeT LinearPCG::pcg(cuda_tool::DenseVectorView<Float>  x,
 
         // z = P * r (apply preconditioner)
         {
-            MeshFEM::BENCHMARK_SCOPED_TIMER_SECTION timer("Apply Preconditioner");
+            SyncedTimer timer("Apply Preconditioner");
             apply_preconditioner(z, r, d_converged_false.view());
         }
 

@@ -7,6 +7,7 @@
 
 #include <cmath>
 #include <stdexcept>
+#include <string>
 
 using namespace MeshFEM;
 
@@ -60,18 +61,24 @@ Eigen::VectorXd expectedSolution(size_t n) {
 }
 
 TEST_CASE("CUDA PCG defaults match libuipc", "[cudapcg]") {
-    CudaPCGWrapper pcg;
+    REQUIRE(CudaPCGWrapper().solver() == "fused_pcg");  // libuipc config linear_system/solver
+
+    const std::string solver = GENERATE(std::string("fused_pcg"), std::string("linear_pcg"));
+    CAPTURE(solver);
+    CudaPCGWrapper pcg(solver);
     REQUIRE(pcg.tolRate() == 1e-3);      // libuipc config linear_system/tol_rate
-    REQUIRE(pcg.maxIterRatio() == 2.0);  // libuipc LinearPCG::do_build
+    REQUIRE(pcg.maxIterRatio() == 2.0);  // libuipc do_build
 }
 
 TEST_CASE("CUDA PCG solves SPD block systems", "[cudapcg]") {
+    const std::string solver = GENERATE(std::string("fused_pcg"), std::string("linear_pcg"));
+    CAPTURE(solver);
     const SuiteSparseMatrix scalarA = gridSystem(6, 1e-2);
     const Eigen::VectorXd expected = expectedSolution(scalarA.n);
     const Eigen::VectorXd b = scalarA.apply(expected);
 
     auto check = [&](const BlockCSCHessianBase &H) {
-        CudaPCGWrapper pcg;
+        CudaPCGWrapper pcg(solver);
         pcg.setTolRate(1e-16);           // |r.z| <= tolRate |r0.z0|
         pcg.compute(H);
         Eigen::VectorXd x = pcg.solve(b);
@@ -92,11 +99,13 @@ TEST_CASE("CUDA PCG solves SPD block systems", "[cudapcg]") {
 }
 
 TEST_CASE("CUDA PCG converges with the libuipc default tolerance", "[cudapcg]") {
+    const std::string solver = GENERATE(std::string("fused_pcg"), std::string("linear_pcg"));
+    CAPTURE(solver);
     const SuiteSparseMatrix scalarA = gridSystem(6, 1e-2);
     const Eigen::VectorXd b = scalarA.apply(expectedSolution(scalarA.n));
     auto H = BlockCSCHessianBase::fromScalar(scalarA, 3);
 
-    CudaPCGWrapper pcg;
+    CudaPCGWrapper pcg(solver);
     pcg.compute(*H);
     Eigen::VectorXd x = pcg.solve(b);
     CAPTURE(pcg.iterCount());
@@ -107,8 +116,9 @@ TEST_CASE("CUDA PCG converges with the libuipc default tolerance", "[cudapcg]") 
 TEST_CASE("CUDA PCG rejects invalid input", "[cudapcg]") {
     const SuiteSparseMatrix scalarA = gridSystem(3, 1e-2);
     const Eigen::VectorXd b = Eigen::VectorXd::Ones(scalarA.n);
-    CudaPCGWrapper pcg;
+    REQUIRE_THROWS_AS(CudaPCGWrapper("cg"), std::runtime_error);             // unknown solver
 
+    CudaPCGWrapper pcg;
     REQUIRE_THROWS_AS(pcg.solve(b), std::runtime_error);                     // before compute
     pcg.compute(*BlockCSCHessianBase::fromScalar(scalarA, 3));
     REQUIRE_THROWS_AS(pcg.solve(b.head(scalarA.n - 3)), std::runtime_error); // wrong size

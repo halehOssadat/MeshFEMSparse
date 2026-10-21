@@ -1,7 +1,7 @@
 #include <linear_system/global_linear_system.h>
 #include <linear_system/iterative_solver.h>
 #include <uipc/common/log.h>
-#include <MeshFEMCore/GlobalBenchmark.hh>
+#include <linear_system/synced_timer.h>
 
 namespace uipc::backend::cuda
 {
@@ -25,14 +25,19 @@ void GlobalLinearSystem::Impl::build_linear_system(int              block_rows,
     triplet_A.col_indices().copy_from(col_indices);
     triplet_A.values().copy_from(values);
 
-    // Convert To BCOO (libuipc build_linear_system)
-    converter.ge2sym(triplet_A);
-    converter.convert(triplet_A, bcoo_A);
-    // upload the nnz count for graph-stable SpMV launches (async on the
-    // default stream; drained before any solve reads it)
-    triplet_count_dev = (IndexT)bcoo_A.triplet_count();
+    {
+        SyncedTimer t("Convert To BCOO");
+        converter.ge2sym(triplet_A);
+        converter.convert(triplet_A, bcoo_A);
+        // upload the nnz count for graph-stable SpMV launches (async on the
+        // default stream; drained before any solve reads it)
+        triplet_count_dev = (IndexT)bcoo_A.triplet_count();
+    }
 
-    _assemble_preconditioner();
+    {
+        SyncedTimer t("Assemble Preconditioner");
+        _assemble_preconditioner();
+    }
 }
 
 void GlobalLinearSystem::Impl::_assemble_preconditioner()
@@ -44,7 +49,7 @@ void GlobalLinearSystem::Impl::_assemble_preconditioner()
 
 void GlobalLinearSystem::Impl::solve_linear_system()
 {
-    MeshFEM::BENCHMARK_SCOPED_TIMER_SECTION timer("Solve Linear System");
+    SyncedTimer timer("Solve Linear System");
     if(iterative_solver)
     {
         SolvingInfo info{this};
