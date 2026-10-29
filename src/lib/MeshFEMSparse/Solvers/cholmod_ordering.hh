@@ -40,6 +40,25 @@ public:
 #endif
     }
     size_t temporalReusePeriod() const { return m_temporalReusePeriod; }
+    // Promotion is an optional repair policy within temporal reuse. A zero
+    // reuse period still disables the entire temporal path, regardless of depth.
+    void setTemporalReusePromotionDepth(int depth) {
+        if (depth < -1) throw std::invalid_argument("temporal reuse promotion depth must be >= -1");
+        if (m_temporalReusePromotionDepth != depth) resetTemporalReuse();
+        m_temporalReusePromotionDepth = depth;
+#if MESHFEM_WITH_CHOLMOD
+        m_reuseLong.promotion_depth = m_reuseInt.promotion_depth = depth;
+#endif
+    }
+    int temporalReusePromotionDepth() const { return m_temporalReusePromotionDepth; }
+    void setUseCAMDRepair(bool enabled) {
+        if (m_useCAMDRepair != enabled) resetTemporalReuse();
+        m_useCAMDRepair = enabled;
+#if MESHFEM_WITH_CHOLMOD
+        m_reuseLong.use_camd_repair = m_reuseInt.use_camd_repair = enabled;
+#endif
+    }
+    bool useCAMDRepair() const { return m_useCAMDRepair; }
     void resetTemporalReuse() {
 #if MESHFEM_WITH_CHOLMOD
         m_reuseLong.reset();
@@ -98,6 +117,8 @@ public:
 private:
     bool m_ndCompress = true;
     size_t m_temporalReusePeriod = 0;
+    int m_temporalReusePromotionDepth = 0;
+    bool m_useCAMDRepair = false;
 #if MESHFEM_WITH_CHOLMOD
     std::unique_ptr<cholmod_common> m_c, m_c_int;
     CholmodParallelNesdis::TemporalReuseState<int64_t> m_reuseLong;

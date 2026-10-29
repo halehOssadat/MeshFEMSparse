@@ -126,7 +126,7 @@ void checkBlocks(bool single, bool left, CatamariFactorizer::OrderingMethod orde
 TEST_CASE("Catamari precision preserves scalar and block solver behavior", "[catamari][precision]") {
     const bool single = GENERATE(false, true);
     const bool left = GENERATE(false, true);
-    const auto ordering = GENERATE(CatamariFactorizer::OrderingMethod::Native, CatamariFactorizer::OrderingMethod::AMD, CatamariFactorizer::OrderingMethod::CholmodNesdisParallel, CatamariFactorizer::OrderingMethod::Adaptive);
+    const auto ordering = GENERATE(CatamariFactorizer::OrderingMethod::Native, CatamariFactorizer::OrderingMethod::Catamari, CatamariFactorizer::OrderingMethod::AMD, CatamariFactorizer::OrderingMethod::CholmodNesdisParallel, CatamariFactorizer::OrderingMethod::Adaptive);
     const int pinMode = GENERATE(0, 1, 2);
     const bool contiguous = GENERATE(false, true);
     SECTION("scalar blocks") { checkBlocks<1>(single, left, ordering, pinMode, contiguous, true); }
@@ -349,6 +349,8 @@ TEST_CASE("Catamari temporal ND provider defaults to 64 incremental analyses", "
     REQUIRE(f != nullptr);
     REQUIRE(f->orderingMethod == CatamariFactorizer::OrderingMethod::CholmodNesdisParallel);
     REQUIRE(f->temporalReusePeriod() == 64);
+    REQUIRE(f->temporalReusePromotionDepth() == 0);
+    REQUIRE_FALSE(f->useCAMDRepair());
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
 
     TripletMatrix<> triplets(16, 16);
@@ -373,8 +375,37 @@ TEST_CASE("Catamari temporal ND provider defaults to 64 incremental analyses", "
 
     f->setTemporalReusePeriod(8);
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisReuse);
+    f->setTemporalReusePromotionDepth(3);
+    REQUIRE(f->temporalReusePromotionDepth() == 3);
+    REQUIRE(f->temporalReusePeriod() == 8);
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE(f->temporalReuseStatistics().full_rebuild);
+    f->setTemporalReusePromotionDepth(3); // Reassigning a setting retains history.
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE_FALSE(f->temporalReuseStatistics().full_rebuild);
+    REQUIRE_THROWS_AS(f->setTemporalReusePromotionDepth(-2), std::invalid_argument);
+    REQUIRE(f->temporalReusePromotionDepth() == 3);
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE_FALSE(f->temporalReuseStatistics().full_rebuild);
+    f->setTemporalReusePromotionDepth(-1);
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE(f->temporalReuseStatistics().full_rebuild);
+    f->resetAnalysisPhaseTemporalCache();
+    REQUIRE(f->temporalReusePromotionDepth() == -1);
+    f->setUseCAMDRepair(true);
+    REQUIRE(f->useCAMDRepair());
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE_FALSE(f->temporalReuseStatistics().camd_repaired);
+    f->setUseCAMDRepair(true); // Reassigning retains permutation history.
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE(f->temporalReuseStatistics().camd_repaired);
+    f->setUseCAMDRepair(false);
+    base->factorizeSymbolic(matrix, {});
+    REQUIRE_FALSE(f->temporalReuseStatistics().camd_repaired);
     f->setTemporalReusePeriod(0);
     REQUIRE(base->provider() == CholeskyProvider::CatamariNesdisParallel);
+    base->factorizeSymbolic(matrix, {}); // The period remains the master enable.
+    REQUIRE(f->temporalReuseStatistics().graph_vertices == 0);
     auto plain = make_cholesky_factorizer(CholeskyProvider::CatamariNesdisParallel, single);
     REQUIRE(plain->provider() == CholeskyProvider::CatamariNesdisParallel);
     REQUIRE(dynamic_cast<CatamariFactorizer &>(*plain).temporalReusePeriod() == 0);
@@ -481,6 +512,222 @@ TEST_CASE("Catamari compact block maps survive forest factorization and reuse", 
     tbb::global_control limit(tbb::global_control::max_allowed_parallelism, threads);
     SECTION("two components per block") { checkBlockForest<2>(single, left); }
     SECTION("three components per block") { checkBlockForest<3>(single, left); }
+}
+
+TEST_CASE("Catamari elimination workspace survives changing graphs and arenas", "[catamari][symbolic_workspace]") {
+    using namespace catamari;
+    SparseLDL<double> factor;
+    SparseLDLControl<double> control;
+    control.supernodal_strategy = kSupernodalFactorization;
+    int step = 0;
+    for (Int width : {12, 12, 4, 28, 28, 1}) {
+        const Int n = 3 * width + 2;
+        const int threads = 1 + step % 4;
+        tbb::task_arena arena(threads);
+        SymmetricOrdering ordering;
+        ordering.supernode_sizes = Buffer<Int>{width, width, width, 2};
+        OffsetScan(ordering.supernode_sizes, &ordering.supernode_offsets);
+        ordering.assembly_forest.parents = Buffer<Int>{2, 2, -1, -1};
+        ordering.assembly_forest.FillFromParents();
+        ordering.permutation.Resize(n);
+        ordering.inverse_permutation.Resize(n);
+        auto original = [&](Int i) { return step % 2 ? n - 1 - i : i; };
+        for (Int i = 0; i < n; ++i) {
+            ordering.inverse_permutation[i] = original(i);
+            ordering.permutation[original(i)] = i;
+        }
+        CoordinateMatrix<double> matrix;
+        matrix.Resize(n, n);
+        for (Int i = 0; i < n; ++i) {
+            matrix.QueueEntryAddition(original(i), original(i), n + 1.0);
+            for (Int j = i + 1; j < n; ++j) {
+                const bool same_tree = (i < 3 * width) == (j < 3 * width);
+                const bool separated = i < width && j >= width && j < 2 * width;
+                if (!same_tree || separated || (13 * i + 7 * j + step) % 11 > 3) continue;
+                matrix.QueueEntryAddition(original(i), original(j), -0.25);
+                matrix.QueueEntryAddition(original(j), original(i), -0.25);
+            }
+        }
+        matrix.FlushEntryQueues();
+        Buffer<Int> parents, degrees;
+        scalar_ldl::EliminationForestAndDegrees(matrix, ordering, &parents, &degrees);
+        auto& workspace = factor.elimination_workspace;
+        const auto* old_heads = workspace.child_heads.Data();
+        const auto old_capacity = workspace.child_heads.Capacity();
+        arena.execute([&] {
+            scalar_ldl::ParallelEliminationForestAndDegrees(
+                matrix, ordering, &workspace.parents, &workspace.degrees, &workspace);
+        });
+        REQUIRE(workspace.parents == parents);
+        REQUIRE(workspace.degrees == degrees);
+        if (old_capacity >= UInt(n)) REQUIRE(workspace.child_heads.Data() == old_heads);
+        const auto* heads = workspace.child_heads.Data();
+        arena.execute([&] { factor.Factor(matrix, ordering, control, true); });
+        REQUIRE(workspace.parents == parents);
+        REQUIRE(workspace.degrees == degrees);
+        REQUIRE(workspace.child_heads.Data() == heads);
+        auto clone = factor.Clone();
+        REQUIRE(clone->elimination_workspace.child_heads.Empty());
+        ++step;
+    }
+}
+
+TEMPLATE_TEST_CASE("Catamari compressed patterns match COO symbolic analysis", "[catamari][pattern_view]", float, double) {
+    using namespace catamari;
+    using Field = TestType;
+    const int threads = GENERATE(1, 4);
+    const int ordering_mode = GENERATE(0, 1, 2); // natural, reversed, minimum degree
+    const bool wide_indices = GENERATE(false, true);
+    tbb::global_control limit(tbb::global_control::max_allowed_parallelism, threads);
+    SparseLDL<Field> coo, compressed;
+    SparseLDLControl<Field> control;
+    control.supernodal_strategy = kSupernodalFactorization;
+    for (Int side : {7, 11, 5}) {
+        CAPTURE(side, threads, ordering_mode, wide_indices);
+        const Int n = side * side + 2; // Include a disconnected component.
+        CoordinateMatrix<Field> matrix;
+        matrix.Resize(n, n);
+        for (Int i = 0; i < n; ++i) {
+            matrix.QueueEntryAddition(i, i, Field(5));
+            for (Int j : {i < side * side && i % side + 1 < side ? i + 1 : -1,
+                          i + side < side * side ? i + side : -1,
+                          i == n - 2 ? n - 1 : -1}) {
+                if (j < 0) continue;
+                matrix.QueueEntryAddition(i, j, Field(-0.5));
+                matrix.QueueEntryAddition(j, i, Field(-0.5));
+            }
+        }
+        matrix.FlushEntryQueues();
+        SymmetricOrdering ordering;
+        if (ordering_mode == 1) {
+            ordering.permutation.Resize(n);
+            ordering.inverse_permutation.Resize(n);
+            for (Int i = 0; i < n; ++i)
+                ordering.permutation[i] = ordering.inverse_permutation[i] = n - 1 - i;
+        }
+        if (ordering_mode == 2) coo.Factor(matrix, control, true);
+        else coo.Factor(matrix, ordering, control, true);
+        auto analyze = [&](auto index_type) {
+            using Index = decltype(index_type);
+            std::vector<Index> offsets(n + 1), indices(matrix.NumEntries());
+            for (Int i = 0; i <= n; ++i) offsets[i] = matrix.RowEntryOffset(i);
+            for (Int i = 0; i < matrix.NumEntries(); ++i) indices[i] = matrix.Entry(i).column;
+            SparsePatternView<Index> pattern(n, offsets.data(), indices.data());
+            REQUIRE(pattern.IndexData() == indices.data());
+            REQUIRE(pattern.OffsetData() == offsets.data());
+            if (ordering_mode == 2) compressed.AnalyzePattern(pattern, control);
+            else compressed.AnalyzePattern(pattern, ordering, control);
+        };
+        if (wide_indices) analyze(int64_t{});
+        else analyze(int32_t{});
+        // The borrowed arrays have now been destroyed; the factor owns its structure.
+        const auto &a = *coo.supernodal_factorization, &b = *compressed.supernodal_factorization;
+        REQUIRE(a.ordering_.permutation == b.ordering_.permutation);
+        REQUIRE(a.ordering_.inverse_permutation == b.ordering_.inverse_permutation);
+        REQUIRE(a.ordering_.supernode_sizes == b.ordering_.supernode_sizes);
+        REQUIRE(a.ordering_.assembly_forest.parents == b.ordering_.assembly_forest.parents);
+        REQUIRE(a.lower_factor_->NumStructureEntries() == b.lower_factor_->NumStructureEntries());
+        for (Int node = 0; node < Int(a.ordering_.supernode_sizes.Size()); ++node) {
+            REQUIRE(a.lower_factor_->StructureEnd(node) - a.lower_factor_->StructureBeg(node) ==
+                    b.lower_factor_->StructureEnd(node) - b.lower_factor_->StructureBeg(node));
+            REQUIRE(std::equal(a.lower_factor_->StructureBeg(node), a.lower_factor_->StructureEnd(node),
+                               b.lower_factor_->StructureBeg(node)));
+        }
+        REQUIRE(a.factor_values_.Height() == b.factor_values_.Height());
+        REQUIRE(a.nnz_ == b.nnz_);
+    }
+}
+
+TEMPLATE_TEST_CASE("Catamari factor values retain capacity across symbolic rebuilds", "[catamari][factor_values]", float, double) {
+    using namespace catamari;
+    using Field = TestType;
+    const bool automatic = GENERATE(false, true), expand = GENERATE(false, true);
+    auto factor = std::make_unique<SparseLDL<Field>>();
+    SparseLDLControl<Field> control;
+    control.supernodal_strategy = kSupernodalFactorization;
+    for (Int n : {12, 12, 4, 10, 28, 29, 29, 1}) {
+        CAPTURE(n, automatic, expand);
+        CoordinateMatrix<Field> matrix;
+        matrix.Resize(n, n);
+        for (Int j = 0; j < n; ++j) for (Int i = 0; i < n; ++i)
+            matrix.QueueEntryAddition(i, j, i == j ? Field(n + 1) : Field(-0.125));
+        matrix.FlushEntryQueues();
+        SymmetricOrdering ordering;
+        ordering.permutation.Resize(n);
+        ordering.inverse_permutation.Resize(n);
+        for (Int j = 0; j < n; ++j) ordering.permutation[j] = ordering.inverse_permutation[j] = j;
+        const Field *old_data = nullptr;
+        UInt old_capacity = 0;
+        if (factor->supernodal_factorization) {
+            const auto& values = factor->supernodal_factorization->factor_values_.data;
+            old_data = values.Data();
+            old_capacity = values.Capacity();
+        }
+        Buffer<Field> deferred;
+        if (automatic) factor->Factor(matrix, control, true, expand ? &deferred : nullptr);
+        else factor->Factor(matrix, ordering, control, true, expand ? &deferred : nullptr);
+        if (expand) {
+            REQUIRE(deferred.Data() == old_data);
+            REQUIRE(deferred.Capacity() == old_capacity);
+            REQUIRE(factor->supernodal_factorization->factor_values_.Data() != deferred.Data());
+            factor = factor->ExpandSymbolicFactorizationToScalar(3, &deferred);
+            REQUIRE(deferred.Capacity() == 0);
+        }
+        auto& f = *factor->supernodal_factorization;
+        auto& values = f.factor_values_;
+        REQUIRE(values.Data() == values.data.Data());
+        REQUIRE(values.Height() == Int(values.data.Size()));
+        REQUIRE(values.Width() == 1);
+        REQUIRE(values.data.Capacity() >= old_capacity);
+        if (values.data.Size() <= old_capacity) {
+            REQUIRE(values.Data() == old_data);
+            REQUIRE(values.data.Capacity() == old_capacity);
+        }
+        else {
+            const auto size = values.data.Size();
+            REQUIRE(values.data.Capacity() == size + (old_capacity ? size / 8 : 0));
+        }
+        for (Int s = 0; s < Int(f.ordering_.supernode_sizes.Size()); ++s) {
+            const auto &db = f.diagonal_factor_->blocks[s], &lb = f.lower_factor_->blocks[s];
+            REQUIRE(db.Data() >= values.Data());
+            REQUIRE(lb.Data() == db.Data() + db.Height());
+            REQUIRE(db.Data() + db.Width() * db.LeadingDimension() <= values.Data() + values.Height());
+        }
+        // Clones retain independent ownership while the original is recycled.
+        std::fill(values.data.begin(), values.data.end(), Field(17));
+        auto clone = factor->Clone();
+        REQUIRE(clone->supernodal_factorization->factor_values_.Data() != values.Data());
+        values.data[0] = Field(-3);
+        REQUIRE(clone->supernodal_factorization->factor_values_.data[0] == Field(17));
+    }
+}
+
+TEST_CASE("Catamari recycled factor values handle changing matrices and block modes", "[catamari][factor_values]") {
+    const bool single = GENERATE(false, true), left = GENERATE(false, true);
+    CatamariFactorizer factor(false, single);
+    factor.orderingMethod = CatamariFactorizer::OrderingMethod::CholmodNesdisParallel;
+    factor.setUseLeftLooking(left);
+    int step = 0;
+    for (size_t n : {12, 12, 4, 10, 28, 28, 2}) {
+        CAPTURE(step, single, left);
+        SystemAssembler<3> assembler(n);
+        auto pattern = assembler.blockSparsityPattern(n - 1, [](size_t i) { return std::array<size_t, 2>{{i, i + 1}}; });
+        pattern->setZero();
+        for (auto entry : pattern->toScalar())
+            pattern->addNZScalar(entry.i, entry.j, entry.i == entry.j ? 12 + step : -0.05 * (step + 1));
+        auto matrix = pattern->cloneWithContiguousBlocks();
+        const auto scalar = matrix->toScalar();
+        factor.setUseBlockAccel(step != 2);
+        const std::vector<size_t> pins = step == 3 ? std::vector<size_t>{0, 1, 2}
+                                      : step == 4 ? std::vector<size_t>{1} : std::vector<size_t>{};
+        factor.factorizeSymbolic(*matrix, pins);
+        factor.factorizeNumeric(*matrix);
+        Eigen::VectorXd expected = Eigen::VectorXd::LinSpaced(3 * n, -1, 1);
+        for (auto pin : pins) expected[pin] = 0;
+        Eigen::VectorXd rhs = scalar.apply(expected);
+        REQUIRE((factor.solve(rhs) - expected).norm() < (single ? 1e-5 : 1e-11) * expected.norm());
+        ++step;
+    }
 }
 
 TEST_CASE("Catamari symbolic scaling never expands stored row indices", "[catamari][block_indices]") {

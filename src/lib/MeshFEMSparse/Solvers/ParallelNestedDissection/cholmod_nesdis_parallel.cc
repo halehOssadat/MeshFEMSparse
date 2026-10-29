@@ -9,6 +9,7 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <sstream>
 #include <iomanip>
 #include <stdexcept>
@@ -1384,8 +1385,9 @@ static std::string partition_settings(const cholmod_common &common, const Nesdis
 // reuse period, and preserves vertex identities across analyses (reset after
 // relabeling). Missing/incompatible history, period expiry, or a global separator
 // violation triggers full ND; otherwise repair only dirty subtrees with NDOnly.
-// In either case, run final constrained ordering on the current graph; repaired
-// or unchanged forests are flattened through ReusedTree without repeating ND.
+// In either case, run final constrained ordering on the current graph, unless
+// the previous permutation can be repaired without rebuilding any subtrees.
+// Repaired or unchanged forests are flattened through ReusedTree without repeating ND.
 // Commit history only after success; an empty input clears the history.
 template<class Int>
 static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t fsize,
@@ -1404,7 +1406,16 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
     }
     Common->status = CHOLMOD_OK;
     const auto start = std::chrono::steady_clock::now();
-    auto settings = partition_settings(*Common, options);
+    // Changing promotion policy starts fresh history, including for direct
+    // callers that configure TemporalReuseState without the wrapper setters.
+    auto settings = partition_settings(*Common, options) + " promotion " + std::to_string(reuse.promotion_depth);
+    const auto &method = Common->method[Common->current];
+    // Only symmetric CAMD orderings participate. Changes to final-ordering
+    // settings force CAMD without unnecessarily rebuilding the ND tree.
+    const bool cache_ordering = reuse.use_camd_repair && A->stype != 0 && method.nd_camd == 1;
+    std::string ordering_settings;
+    if (cache_ordering) ordering_settings = std::to_string(method.aggressive) + " " +
+        std::to_string(options.camd.cut_depth) + " " + std::to_string(options.camd.skip_upper);
     const bool have_tree = !reuse.tree.roots.empty() && reuse.tree.member.size() == A->nrow;
     bool full = !have_tree || settings != reuse.partition_settings ||
         reuse.incremental_analyses_since_rebuild >= reuse.temporal_reuse_period;
@@ -1413,6 +1424,9 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
     std::unique_ptr<cholmod_sparse, decltype(deleter)> owned(nullptr, deleter);
     const cholmod_sparse *graph = FullGraph;
     typename PersistentSeparatorTree<Int>::DirtySubtrees dirty;
+    TemporalReuseStatistics statistics;
+    PersistentSeparatorTree<Int> candidate;
+    const auto *tree = &reuse.tree;
     if (!full) {
         if (!graph) {
             owned.reset(A->stype ? CholmodApi<Int>::copy(A, 0, -1, Common)
@@ -1420,17 +1434,23 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
             if (!owned || Common->status < CHOLMOD_OK) return EMPTY;
             graph = owned.get();
         }
-        dirty = reuse.tree.dirty_subtrees(static_cast<const Int *>(graph->p),
-                                          static_cast<const Int *>(graph->i));
+        if (reuse.promotion_depth != 0) {
+            BENCHMARK_SCOPED_TIMER_SECTION timer("temporal ND promotion");
+            candidate = reuse.tree;
+            statistics.promoted_vertices = candidate.promote_violations(
+                static_cast<const Int *>(graph->p), static_cast<const Int *>(graph->i), reuse.promotion_depth);
+            if (statistics.promoted_vertices) tree = &candidate;
+        }
+        dirty = tree->dirty_subtrees(static_cast<const Int *>(graph->p),
+                                    static_cast<const Int *>(graph->i));
         full = dirty.full_rebuild;
     }
-    TemporalReuseStatistics statistics;
     statistics.full_rebuild = full;
     statistics.graph_vertices = A->nrow;
-    PersistentSeparatorTree<Int> candidate;
     int64_t nc;
     double ordering_nd_seconds = 0;
     if (full) {
+        statistics.promoted_vertices = 0;
         BENCHMARK_SCOPED_TIMER_SECTION tfull_recompute("full ND recompute");
         const double preparation_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
@@ -1455,11 +1475,11 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
                 typename PersistentSeparatorTree<Int>::SubtreeRegionLabels region_labels;
                 {
                     // BENCHMARK_SCOPED_TIMER_SECTION label_timer("label and reserve regions");
-                    region_labels = reuse.tree.label_subtree_regions(dirty.roots, regions);
+                    region_labels = tree->label_subtree_regions(dirty.roots, regions);
                 }
                 {
                     // BENCHMARK_SCOPED_TIMER_SECTION gather_timer("gather vertices and inverse map");
-                    reuse.tree.gather_subtree_regions(region_labels, regions, local_index);
+                    tree->gather_subtree_regions(region_labels, regions, local_index);
                 }
                 for (const auto &region : regions) statistics.repartitioned_vertices += region.size();
             }
@@ -1474,23 +1494,46 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
                     // Scotch's level limit refers to depth in the persistent tree,
                     // while recursion on the induced graph starts at depth zero.
                     subtree_options.scotch_levels = int(std::max<int64_t>(0,
-                        int64_t(options.scotch_levels) - reuse.tree.depth[dirty.roots[r]]));
+                        int64_t(options.scotch_levels) - tree->depth[dirty.roots[r]]));
                     replacements[r] = compute_nd_subtree<Int>(*graph, regions[r], local_index, *Common, subtree_options);
                 });
             }
             {
                 BENCHMARK_SCOPED_TIMER_SECTION timer("temporal ND region splicing");
-                candidate = reuse.tree;
+                if (tree == &reuse.tree) candidate = reuse.tree;
                 for (size_t r = 0; r < regions.size(); ++r)
                     candidate.replace(dirty.roots[r], replacements[r], regions[r]);
                 candidate.update_depths();
+                tree = &candidate;
             }
         }
         statistics.recomputed_subtrees = regions.size();
-        const auto *tree = regions.empty() ? &reuse.tree : &candidate;
         const double repair_seconds = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - start).count();
-        {
+        if (cache_ordering && dirty.roots.empty() && reuse.permutation.size() == A->nrow &&
+            reuse.ordering_settings == ordering_settings) {
+            // BENCHMARK_SCOPED_TIMER_SECTION timer("temporal CAMD repair");
+            nc = tree->flatten(CParent, Cmember);
+            if (!statistics.promoted_vertices) {
+                // Hierarchical CAMD may interleave independent subtrees. Keep
+                // that order exactly when separator membership did not change.
+                std::copy(reuse.permutation.begin(), reuse.permutation.end(), Perm);
+            }
+            else {
+                // Stable buckets in current separator postorder. Original residents
+                // precede arrivals; each group retains its previous relative order.
+                std::vector<Int> next(nc + 1, 0);
+                for (size_t v = 0; v < A->nrow; ++v) ++next[Cmember[v] + 1];
+                std::partial_sum(next.begin(), next.end(), next.begin());
+                for (bool moved : {false, true})
+                    for (Int v : reuse.permutation)
+                        if ((tree->member[v] != reuse.tree.member[v]) == moved)
+                            Perm[next[Cmember[v]]++] = v;
+            }
+            statistics.camd_repaired = true;
+            Common->lnz = Common->fl = -1; // No current CAMD estimates.
+        }
+        else {
             BENCHMARK_SCOPED_TIMER_SECTION timer("nested_dissection_impl");
             nc = nested_dissection_impl<Int>(A, fset, fsize, Perm, CParent, Cmember,
                 Common, options, FullGraph, tree, false, &ordering_nd_seconds);
@@ -1498,10 +1541,15 @@ static int64_t nested_dissection_temporal(cholmod_sparse *A, Int *fset, size_t f
         if (nc < 0) return nc;
         statistics.nd_seconds = repair_seconds + ordering_nd_seconds;
     }
+    // Allocate the history before committing either the tree or permutation.
+    std::vector<Int> permutation;
+    if (cache_ordering) permutation.assign(Perm, Perm + A->nrow);
     // Commit only after the final CAMD/permutation stage has succeeded.
-    if (full || !dirty.roots.empty()) reuse.tree = std::move(candidate);
+    if (full || !dirty.roots.empty() || statistics.promoted_vertices) reuse.tree = std::move(candidate);
     reuse.incremental_analyses_since_rebuild = full ? 0 : reuse.incremental_analyses_since_rebuild + 1;
     reuse.partition_settings = std::move(settings);
+    reuse.permutation = std::move(permutation);
+    reuse.ordering_settings = std::move(ordering_settings);
     reuse.statistics = statistics;
     return nc;
 }
@@ -1516,6 +1564,8 @@ static int64_t nested_dissection_checked(cholmod_sparse *A, Int *fset, size_t fs
     // The C and full-graph APIs share one exception boundary, including optional
     // diagnostics. Internal catches only clean up owned storage before rethrowing.
     try {
+        if (reuse && reuse->promotion_depth < -1)
+            throw std::invalid_argument("temporal reuse promotion depth must be >= -1");
         const NesdisOptions options;
         std::unique_ptr<tbb::global_control> thread_limit;
         if (options.threads) thread_limit = std::make_unique<tbb::global_control>(
